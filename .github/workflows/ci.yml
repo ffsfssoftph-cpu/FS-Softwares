@@ -1,5 +1,164 @@
-name: CI - FS Softwares
+# CI workflow with robustness improvements:
+# - Enforce public npm registry
+# - Retry npm install with fallback to --force
+# - Ensure prisma CLI is present before generate
+# - Use `prisma migrate deploy` (CI-safe)
+# - Collect diagnostics and upload artifact on failure
+name: CI
 
+on:
+  push:
+    branches:
+      - main
+      - 'releases/**'
+  pull_request:
+
+jobs:
+  build:
+    name: Build, Migrate & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          check-latest: true
+
+      - name: Enforce public npm registry
+        run: |
+          # Ensure we use the public npm registry in CI (prevents private-registry surprises)
+          npm config set registry https://registry.npmjs.org/
+          echo "npm registry: $(npm config get registry)"
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies (retries and fallback)
+        # This step retries npm ci up to 3 times, then falls back to a --force attempt.
+        run: |
+          set -euo pipefail
+          max_attempts=3
+          attempt=1
+
+          echo "Starting install attempts (max ${max_attempts})"
+          until [ $attempt -gt $max_attempts ]; do
+            echo "Attempt $attempt/${max_attempts}: npm ci --no-audit --no-fund"
+            if npm ci --no-audit --no-fund; then
+              echo "npm ci succeeded"
+              break
+            fi
+            echo "npm ci failed on attempt ${attempt}"
+            attempt=$((attempt + 1))
+            # incremental backoff
+            sleep $((attempt * 5))
+          done
+
+          if [ $attempt -gt $max_attempts ]; then
+            echo "All npm ci attempts failed — retrying with --force fallback"
+            # Try a forced install. Try npm ci --force first (if supported), then npm install --force.
+            if npm ci --force --no-audit --no-fund; then
+              echo "npm ci --force succeeded"
+            elif npm install --force --no-audit --no-fund; then
+              echo "npm install --force succeeded"
+            else
+              echo "Forced installs failed — collect quick diagnostics and exit with non-zero"
+              mkdir -p ci-diagnostics
+              npm --version > ci-diagnostics/npm-version.txt || true
+              node --version > ci-diagnostics/node-version.txt || true
+              npm config list > ci-diagnostics/npm-config.txt || true
+              npm cache verify > ci-diagnostics/npm-cache-verify.txt || true
+              ls -la > ci-diagnostics/ls-root.txt || true
+              # Leave npm logs where upload step can pick them up
+              cp package-lock.json ci-diagnostics/ 2>/dev/null || true
+              if [ -f npm-debug.log ]; then cp npm-debug.log ci-diagnostics/ || true; fi
+              exit 1
+            fi
+          fi
+
+      - name: Ensure Prisma CLI is available
+        run: |
+          set -euo pipefail
+          # Prefer project-local prisma binary (installed in node_modules). Use npx to check.
+          if npx prisma --version >/dev/null 2>&1; then
+            echo "Local prisma binary is present"
+            npx prisma --version
+          else
+            echo "prisma binary not found locally; attempting to ensure it's available for CI"
+            # If project doesn't include prisma in devDeps, try a temporary global install (last-resort)
+            if grep -q '"prisma"' package.json >/dev/null 2>&1 || grep -q '"@prisma/client"' package.json >/dev/null 2>&1; then
+              echo "prisma referenced in package.json; trying npx again after installing deps (if needed)"
+              # npm ci already ran above; retry npx
+              if npx prisma --version >/dev/null 2>&1; then
+                npx prisma --version
+              else
+                echo "Still no prisma; installing prisma globally as fallback"
+                npm i -g prisma
+                npx prisma --version
+              fi
+            else
+              echo "prisma not referenced in package.json; installing prisma globally as fallback"
+              npm i -g prisma
+              npx prisma --version
+            fi
+          fi
+
+      - name: Run Prisma migrations (CI-safe)
+        # Use migrate deploy in CI to run already-created migrations
+        run: |
+          set -euo pipefail
+          echo "Running prisma migrate deploy (CI-safe)"
+          # If you rely on DATABASE_URL from secrets, make sure it's set in the workflow env or repo secrets
+          npx prisma migrate deploy
+
+      - name: Generate Prisma client
+        run: |
+          set -euo pipefail
+          echo "Generating prisma client"
+          npx prisma generate
+
+      - name: Run tests
+        run: |
+          set -euo pipefail
+          echo "Running tests (if present)"
+          npm test --if-present
+
+      - name: Post-build diagnostics (always collect)
+        if: always()
+        run: |
+          # Collect lightweight artifacts and debug info always so that the failure upload has content.
+          mkdir -p ci-diagnostics
+          echo "Runner: $RUNNER_OS" > ci-diagnostics/runner.txt
+          node --version > ci-diagnostics/node-version.txt || true
+          npm --version > ci-diagnostics/npm-version.txt || true
+          npm config list > ci-diagnostics/npm-config.txt || true
+          npm cache verify > ci-diagnostics/npm-cache-verify.txt || true
+          # Helpful lists
+          ps aux > ci-diagnostics/ps-aux.txt || true
+          df -h > ci-diagnostics/df-h.txt || true
+          free -m > ci-diagnostics/free-m.txt || true
+          # Package lock and basic files
+          cp package-lock.json ci-diagnostics/ 2>/dev/null || true
+          cp pnpm-lock.yaml ci-diagnostics/ 2>/dev/null || true
+          # capture installed modules tree for troubleshooting (may be large)
+          npm ls --all > ci-diagnostics/npm-ls.txt 2>&1 || true
+          # Prisma version if available
+          if command -v npx >/dev/null 2>&1; then npx prisma --version > ci-diagnostics/prisma-version.txt 2>&1 || true; fi
+
+      - name: Upload diagnostics artifact (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-diagnostics-${{ github.run_id }}
+          path: ci-diagnostics
 on:
   push:
     branches: [ main ]
@@ -26,24 +185,57 @@ jobs:
           - 6379:6379
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Use Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Install root deps
-        run: npm install --legacy-peer-deps
-      - name: Install backend deps
-        run: cd apps/backend && npm install --legacy-peer-deps
+
+      - name: Diagnostics: Node & npm
+        run: |
+          node -v
+          npm -v
+          npm config get registry
+
+      - name: Ensure registry is public npm
+        run: npm config set registry https://registry.npmjs.org/
+
+      - name: Install root deps (retry, legacy-peer-deps)
+        run: |
+          for i in 1 2 3; do npm install --legacy-peer-deps && break || sleep 5; done || npm install --legacy-peer-deps --force
+
+      - name: Install backend deps (retry)
+        run: |
+          cd apps/backend
+          for i in 1 2 3; do npm install --legacy-peer-deps && break || sleep 5; done || npm install --legacy-peer-deps --force
+
       - name: Generate Prisma client
-        run: cd apps/backend && npx prisma generate --schema=prisma/schema.prisma
-      - name: Run Prisma migrate
+        run: |
+          cd apps/backend
+          npx prisma --version || npm install prisma --no-save
+          npx prisma generate --schema=prisma/schema.prisma
+
+      - name: Run Prisma migrations (CI-safe)
         env:
           DATABASE_URL: postgresql://fs_user:fs_password@localhost:5432/fs_db
-        run: cd apps/backend && npx prisma migrate deploy --schema=prisma/schema.prisma
+        run: |
+          cd apps/backend
+          # use deploy in CI to apply already-migrated SQL
+          npx prisma migrate deploy --schema=prisma/schema.prisma
+
       - name: Build web app
-        run: cd apps/web && npm install --legacy-peer-deps && npm run build
+        run: |
+          cd apps/web
+          npm install --legacy-peer-deps || npm install --legacy-peer-deps --force
+          npm run build
+
       - name: Build backend
-        run: cd apps/backend && npm run build
+        run: |
+          cd apps/backend
+          npm run build
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -51,3 +243,13 @@ jobs:
           path: |
             apps/backend/dist
             apps/web/dist
+
+      - name: Archive CI logs on failure
+        if: failure()
+        run: |
+          echo "CI failed - collecting diagnostics"
+          npm config get registry
+          node -v
+          npm -v
+          ls -la
+          du -sh node_modules || true
