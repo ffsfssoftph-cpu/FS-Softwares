@@ -1,0 +1,18 @@
+appId: com.tophcomm.fssoftwares
+productName: FS Softwares
+directories:
+  output: dist_electron
+files:
+  - apps/web/dist/**
+  - apps/web/electron/**
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  installerIcon: apps/web/public/assets/brand/fs-icon.svg
+win:
+  target:
+    - nsis
+mac:
+  target:
+    - dmg

@@ -1,0 +1,53 @@
+name: CI - FS Softwares
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: fs_user
+          POSTGRES_PASSWORD: fs_password
+          POSTGRES_DB: fs_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fs_user" --health-interval 10s --health-timeout 5s --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install root deps
+        run: npm install --legacy-peer-deps
+      - name: Install backend deps
+        run: cd apps/backend && npm install --legacy-peer-deps
+      - name: Generate Prisma client
+        run: cd apps/backend && npx prisma generate --schema=prisma/schema.prisma
+      - name: Run Prisma migrate
+        env:
+          DATABASE_URL: postgresql://fs_user:fs_password@localhost:5432/fs_db
+        run: cd apps/backend && npx prisma migrate deploy --schema=prisma/schema.prisma
+      - name: Build web app
+        run: cd apps/web && npm install --legacy-peer-deps && npm run build
+      - name: Build backend
+        run: cd apps/backend && npm run build
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fs-artifacts
+          path: |
+            apps/backend/dist
+            apps/web/dist
